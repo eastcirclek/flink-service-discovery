@@ -6,7 +6,6 @@ import re
 import requests
 import sys
 import time
-from collections import namedtuple
 from functools import partial
 
 
@@ -129,6 +128,8 @@ def main():
     parser.add_argument('--app-id', type=str,
                         help='If specified, this program runs once for the application. '
                              'Otherwise, it runs as a service.')
+    parser.add_argument('--name-filter', type=str,
+                        help='A regex to specify applications to watch.')
     parser.add_argument('--target-dir', type=str,
                         help='If specified, this program writes the target information to a file on the directory. '
                              'Files are named after the application ids. '
@@ -136,13 +137,12 @@ def main():
     parser.add_argument('--poll-interval', type=int, default=5,
                         help='Polling interval to YARN in seconds '
                              'to check applications that are newly added or recently finished. '
-                             'Default is 5 seconds')
+                             'Default is 5 seconds.')
 
     args = parser.parse_args()
-    args.rm_addr = args.rm_addr if "://" in args.rm_addr else "http://" + args.rm_addr
-
     app_id = args.app_id
-    rm_addr = args.rm_addr
+    name_filter_regex = None if args.name_filter is None else re.compile(args.name_filter)
+    rm_addr = args.rm_addr if "://" in args.rm_addr else "http://" + args.rm_addr
     target_dir = args.target_dir
 
     if target_dir is not None and not os.path.isdir(target_dir):
@@ -173,11 +173,12 @@ def main():
                 break
 
             decoded = r.json()
-            for app in decoded['apps']['app']:
-                print(app)
-                app = namedtuple("App", app.keys())(*app.values())
-                if app.state.lower() == 'running':
-                    running_cur[app.id] = app
+            apps = decoded['apps']['app']
+            if name_filter_regex is not None:
+                apps = list(filter(lambda app: name_filter_regex.match(app['name']), apps))
+            for app in apps:
+                if app['state'].lower() == 'running':
+                    running_cur[app['id']] = app
 
             if running_prev is not None:
                 added = set(running_cur.keys()) - set(running_prev.keys())
