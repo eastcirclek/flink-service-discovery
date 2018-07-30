@@ -125,15 +125,18 @@ def prometheus_addresses(app_id, rm_addr):
 def main():
     parser = argparse.ArgumentParser(description='Discovery for Flink per-job clusters on Hadoop YARN for Prometheus')
     parser.add_argument('rm_addr', type=str,
-                        help='YARN resource manager address')
-    parser.add_argument('--app-name', type=str,
-                        help='')
+                        help='(required) Specify yarn.resourcemanager.webapp.address in your YARN cluster.')
     parser.add_argument('--app-id', type=str,
-                        help='If specified, this program runs once for the application id')
+                        help='If specified, this program runs once for the application. '
+                             'Otherwise, it runs as a service.')
     parser.add_argument('--target-dir', type=str,
-                        help='If specified, this program writes target information into the directory')
+                        help='If specified, this program writes the target information to a file on the directory. '
+                             'Files are named after the application ids. '
+                             'Otherwise, it prints to stdout.')
     parser.add_argument('--poll-interval', type=int, default=5,
-                        help='Polling interval to YARN')
+                        help='Polling interval to YARN in seconds '
+                             'to check applications that are newly added or recently finished. '
+                             'Default is 5 seconds')
 
     args = parser.parse_args()
     args.rm_addr = args.rm_addr if "://" in args.rm_addr else "http://" + args.rm_addr
