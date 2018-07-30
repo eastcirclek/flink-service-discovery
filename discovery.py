@@ -1,116 +1,124 @@
-import argparse, errno, json, os, re, sys, time
-import urllib.request
+import argparse
+import errno
+import json
+import os
+import re
+import requests
+import sys
+import time
 from collections import namedtuple
 from functools import partial
 
 
-def yarn_application_info(app_id, rm_addr):
-    url = rm_addr + '/ws/v1/cluster/apps/' + app_id
-    with urllib.request.urlopen(url) as response:
-        if response.getcode() == 200:
-            text = response.read().decode('utf8')
-            decoded = json.loads(text)
-            return decoded['app']
-
-
-def flink_taskmanagers(jobmanager_url):
-    url = jobmanager_url + '/taskmanagers'
-    with urllib.request.urlopen(url) as response:
-        if response.getcode() == 200:
-            text = response.read().decode('utf8')
-            decoded = json.loads(text)
-            return decoded['taskmanagers']
-
-    return []
-
-
-def flink_jobmanager_prometheus_addr(jobmanager_url):
+def flink_jobmanager_prometheus_addr(jm_url):
     addr = None
     port = None
 
-    url = jobmanager_url + '/jobmanager/log'
-    with urllib.request.urlopen(url) as response:
-        if response.getcode() == 200:
-            lines = response.read().decode('utf8').splitlines()
-            for line in lines:
-                if "YARN assigned hostname for application master" in line:
-                    m = re.search("application master: ([0-9A-Za-z-_]+)", line)
-                    if m:
-                        addr = m.group(1)
-                
-                if "Started PrometheusReporter HTTP server on port" in line:
-                    m = re.search('on port (\d+)', line)
-                    if m:
-                        port = m.group(1)
+    r = requests.get(jm_url+'/jobmanager/log', stream=True)
+    if r.status_code != 200:
+        return ''
 
-                if addr is not None and port is not None:
-                    return addr+':'+port
+    for line in r.iter_lines(decode_unicode=True):
+        if "YARN assigned hostname for application master" in line:
+            m = re.search("application master: ([0-9A-Za-z-_]+)", line)
+            if m:
+                addr = m.group(1)
+
+        if "Started PrometheusReporter HTTP server on port" in line:
+            m = re.search('on port (\d+)', line)
+            if m:
+                port = m.group(1)
+
+        if addr is not None and port is not None:
+            return addr+':'+port
             
     return ''
 
 
-def flink_taskmanager_prometheus_addr(taskmanager_id, jobmanager_url):
+def flink_taskmanager_prometheus_addr(tm_id, jm_url):
     addr = None
     port = None
 
-    url = jobmanager_url + '/taskmanagers/' + taskmanager_id + '/log'
-    with urllib.request.urlopen(url) as response:
-        if response.getcode() == 200:
-            lines=response.read().decode('utf8').splitlines()
-            for line in lines:
-                if "TaskManager will use hostname/address" in line:
-                    m = re.search("address '([0-9A-Za-z-_]+)' \(([\d\.]+)\)", line)
-                    if m:
-                        hostname = m.group(1)
-                        ipaddr = m.group(2)
-                        addr = hostname
+    r = requests.get(jm_url+'/taskmanagers/'+tm_id+'/log', stream=True)
+    if r.status_code != 200:
+        return ''
 
-                if "Started PrometheusReporter HTTP server on port" in line:
-                    m = re.search('on port (\d+)', line)
-                    if m:
-                        port = m.group(1)
+    for line in r.iter_lines(decode_unicode=True):
+        if "TaskManager will use hostname/address" in line:
+            m = re.search("address '([0-9A-Za-z-_]+)' \(([\d.]+)\)", line)
+            if m:
+                hostname = m.group(1)
+                # ipaddr = m.group(2)
+                addr = hostname
 
-                if addr is not None and port is not None:
-                    return addr+':'+port
+        if "Started PrometheusReporter HTTP server on port" in line:
+            m = re.search('on port (\d+)', line)
+            if m:
+                port = m.group(1)
+
+        if addr is not None and port is not None:
+            return addr+':'+port
 
     return ''
+
+
+def yarn_application_info(app_id, rm_addr):
+    r = requests.get(rm_addr + '/ws/v1/cluster/apps/' + app_id)
+    if r.status_code != 200:
+        return {}
+
+    decoded = r.json()
+    return decoded['app'] if 'app' in decoded else {}
+
+
+def taskmanager_ids(jm_url):
+    r = requests.get(jm_url + '/taskmanagers')
+    if r.status_code != 200:
+        return []
+
+    decoded = r.json()
+    if 'taskmanagers' not in decoded:
+        return []
+
+    return [tm['id'] for tm in decoded['taskmanagers']]
 
 
 def prometheus_addresses(app_id, rm_addr):
     while True:
         app_info = yarn_application_info(app_id, rm_addr)
+        if ('runningContainers' not in app_info) or ('trackingUrl' not in app_info):
+            time.sleep(1)
+            continue
+
         if app_info['runningContainers'] == 1:
             print("runningContainers(%d) is still 1" % (app_info['runningContainers'],))
             time.sleep(1)
             continue
 
-        jobmanager_url = app_info['trackingUrl']
-        taskmanagers = flink_taskmanagers(jobmanager_url)
-        if app_info['runningContainers'] != len(taskmanagers)+1:
-            print("runningContainers(%d) != taskmanagers(%d)+1" % (app_info['runningContainers'], len(taskmanagers)))
+        tm_ids = taskmanager_ids(app_info['trackingUrl'])
+        if app_info['runningContainers'] != len(tm_ids)+1:
+            print("runningContainers(%d) != taskmanagers(%d)+1" % (app_info['runningContainers'], len(tm_ids)))
             time.sleep(1)
             continue
 
-        taskmanager_ids = [container['id'] for container in taskmanagers]
-        prometheus_addresses = map(partial(flink_taskmanager_prometheus_addr, jobmanager_url=jobmanager_url), taskmanager_ids)
-        prometheus_addresses = list(filter(lambda x: len(x)>0, prometheus_addresses))
-        if len(taskmanagers) != len(prometheus_addresses):
-            print("taskmanagers(%d) != addresses(%d)" % (len(taskmanagers), len(prometheus_addresses)))
+        prom_addrs = map(partial(flink_taskmanager_prometheus_addr, jm_url=app_info['trackingUrl']), tm_ids)
+        prom_addrs = list(filter(lambda x: len(x) > 0, prom_addrs))
+        if len(tm_ids) != len(prom_addrs):
+            print("Not all taskmanagers open prometheus endpoints. %d of %d opened" % (len(tm_ids), len(prom_addrs)))
             time.sleep(1)
             continue
-
         break
 
     while True:
-        jobmanager_prometheus_addr = flink_jobmanager_prometheus_addr(jobmanager_url)
-        if len(jobmanager_prometheus_addr) == 0:
+        jm_prom_addr = flink_jobmanager_prometheus_addr(app_info['trackingUrl'])
+        if len(jm_prom_addr) == 0:
             time.sleep(1)
             continue
-        prometheus_addresses.append(jobmanager_prometheus_addr)
+
+        prom_addrs.append(jm_prom_addr)
         break
 
-    encoded = json.JSONEncoder().encode([{'targets': prometheus_addresses}])
-
+    encoded = json.JSONEncoder().encode([{'targets': prom_addrs}])
     return encoded
 
 
@@ -118,12 +126,14 @@ def main():
     parser = argparse.ArgumentParser(description='Discovery for Flink per-job clusters on Hadoop YARN for Prometheus')
     parser.add_argument('rm_addr', type=str,
                         help='YARN resource manager address')
+    parser.add_argument('--app-name', type=str,
+                        help='')
     parser.add_argument('--app-id', type=str,
                         help='If specified, this program runs once for the application id')
     parser.add_argument('--target-dir', type=str,
                         help='If specified, this program writes target information into the directory')
     parser.add_argument('--poll-interval', type=int, default=5,
-                        help='How often to check added or removed applications from YARN')
+                        help='Polling interval to YARN')
 
     args = parser.parse_args()
     args.rm_addr = args.rm_addr if "://" in args.rm_addr else "http://" + args.rm_addr
@@ -134,71 +144,71 @@ def main():
 
     if target_dir is not None and not os.path.isdir(target_dir):
         print('cannot find', target_dir)
-        sys.exit()
+        sys.exit(1)
 
     if app_id is not None:
         target_string = prometheus_addresses(app_id, rm_addr)
         if target_dir is not None:
             path = os.path.join(target_dir, app_id+".json")
             with open(path, 'w') as f:
-                print("create a new file :", path)
+                print(path, " : ", target_string)
                 f.write(target_string)
         else:
-            print("- target string :", target_string)
+            print(target_string)
     else:
-        print("Let's start poll every " + str(args.poll_interval) + " seconds.")
+        print("start polling every " + str(args.poll_interval) + " seconds.")
         running_prev = None
         while True:
             running_cur = {}
             added = set()
             removed = set()
             
-            url = rm_addr+'/ws/v1/cluster/apps'
-            with urllib.request.urlopen(url) as response:
-                if response.getcode() == 200:
-                    text = response.read().decode('utf8')
-                    decoded = json.loads(text) # a dictionary of dictionaries
-                    for app in decoded['apps']['app']:
-                        app = namedtuple("App", app.keys())(*app.values())
-                        if app.state.lower() == 'running':
-                            running_cur[app.id] = app
+            r = requests.get(rm_addr+'/ws/v1/cluster/apps')
+            if r.status_code != 200:
+                print("Failed to connect to the server")
+                print("The status code is " + r.status_code)
+                break
 
-                    if running_prev is not None:
-                        added = set(running_cur.keys()) - set(running_prev.keys())
-                        removed = set(running_prev.keys()) - set(running_cur.keys())
+            decoded = r.json()
+            for app in decoded['apps']['app']:
+                print(app)
+                app = namedtuple("App", app.keys())(*app.values())
+                if app.state.lower() == 'running':
+                    running_cur[app.id] = app
 
-                    if len(added) + len(removed) > 0:
-                        print('====',time.strftime("%c"),'====')
-                        print('# running apps : ', len(running_cur))
-                        print('# added        : ', added)
-                        print('# removed      : ', removed)
+            if running_prev is not None:
+                added = set(running_cur.keys()) - set(running_prev.keys())
+                removed = set(running_prev.keys()) - set(running_cur.keys())
 
-                        for app_id in added:
-                            target_string = prometheus_addresses(app_id, rm_addr)
-                            if target_dir is not None:
-                                path = os.path.join(target_dir, app_id+".json")
-                                with open(path, 'w') as f:
-                                    print("- create a new file ", path, "with", target_string)
-                                    f.write(target_string)
-                            else:
-                                print("- target string :", target_string)
+            if len(added) + len(removed) > 0:
+                print('====', time.strftime("%c"), '====')
+                print('# running apps : ', len(running_cur))
+                print('# added        : ', added)
+                print('# removed      : ', removed)
 
-                        for app_id in removed:
-                            if target_dir is not None:
-                                path = os.path.join(target_dir, app_id+".json")
-                                print("- remove an exiting file :", path)
-                                try:
-                                    os.remove(path)
-                                except OSError as e:
-                                    if e.errno != errno.ENOENT:
-                                        # re-raise exception if a different error occurred
-                                        raise
+                for app_id in added:
+                    target_string = prometheus_addresses(app_id, rm_addr)
+                    if target_dir is not None:
+                        path = os.path.join(target_dir, app_id + ".json")
+                        with open(path, 'w') as f:
+                            print(path, " : ", target_string)
+                            f.write(target_string)
+                    else:
+                        print(target_string)
 
-                    running_prev = running_cur
-                else:
-                    print('status code :', response.getcode())
+                for app_id in removed:
+                    if target_dir is not None:
+                        path = os.path.join(target_dir, app_id + ".json")
+                        print(path + " deleted")
+                        try:
+                            os.remove(path)
+                        except OSError as e:
+                            if e.errno != errno.ENOENT:
+                                # re-raise exception if a different error occurred
+                                raise
 
-                time.sleep(args.poll_interval)
+            running_prev = running_cur
+            time.sleep(args.poll_interval)
 
 
 if __name__ == '__main__':
