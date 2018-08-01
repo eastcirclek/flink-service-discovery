@@ -28,9 +28,11 @@ def flink_jobmanager_prometheus_addr(jm_url):
             if m:
                 port = m.group(1)
 
-        if addr is not None and port is not None:
+        cond1 = addr is not None
+        cond2 = port is not None
+        if cond1 and cond2:
             return addr+':'+port
-            
+
     return ''
 
 
@@ -44,10 +46,9 @@ def flink_taskmanager_prometheus_addr(tm_id, jm_url):
 
     for line in r.iter_lines(decode_unicode=True):
         if "TaskManager will use hostname/address" in line:
-            m = re.search("address '([0-9A-Za-z-_]+)' \(([\d.]+)\)", line)
+            m = re.search("address '([0-9A-Za-z-_]+)' \([\d.]+\)", line)
             if m:
                 hostname = m.group(1)
-                # ipaddr = m.group(2)
                 addr = hostname
 
         if "Started PrometheusReporter HTTP server on port" in line:
@@ -55,7 +56,9 @@ def flink_taskmanager_prometheus_addr(tm_id, jm_url):
             if m:
                 port = m.group(1)
 
-        if addr is not None and port is not None:
+        cond1 = addr is not None
+        cond2 = port is not None
+        if cond1 and cond2:
             return addr+':'+port
 
     return ''
@@ -85,7 +88,9 @@ def taskmanager_ids(jm_url):
 def prometheus_addresses(app_id, rm_addr):
     while True:
         app_info = yarn_application_info(app_id, rm_addr)
-        if ('runningContainers' not in app_info) or ('trackingUrl' not in app_info):
+        cond1 = 'runningContainers' not in app_info
+        cond2 = 'trackingUrl' not in app_info
+        if cond1 or cond2:
             time.sleep(1)
             continue
 
@@ -96,7 +101,7 @@ def prometheus_addresses(app_id, rm_addr):
 
         tm_ids = taskmanager_ids(app_info['trackingUrl'])
         if app_info['runningContainers'] != len(tm_ids)+1:
-            print("runningContainers(%d) != taskmanagers(%d)+1" % (app_info['runningContainers'], len(tm_ids)))
+            print("runningContainers(%d) != jobmanager(1)+taskmanagers(%d)" % (app_info['runningContainers'], len(tm_ids)))
             time.sleep(1)
             continue
 
@@ -122,9 +127,9 @@ def prometheus_addresses(app_id, rm_addr):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Discovery for Flink per-job clusters on Hadoop YARN for Prometheus')
+    parser = argparse.ArgumentParser(description='Discover Flink clusters on Hadoop YARN for Prometheus')
     parser.add_argument('rm_addr', type=str,
-                        help='(required) Specify yarn.resourcemanager.webapp.address in your YARN cluster.')
+                        help='(required) Specify yarn.resourcemanager.webapp.address of your YARN cluster.')
     parser.add_argument('--app-id', type=str,
                         help='If specified, this program runs once for the application. '
                              'Otherwise, it runs as a service.')
@@ -154,7 +159,7 @@ def main():
         if target_dir is not None:
             path = os.path.join(target_dir, app_id+".json")
             with open(path, 'w') as f:
-                print(path, " : ", target_string)
+                print(path + " : " + target_string)
                 f.write(target_string)
         else:
             print(target_string)
@@ -165,7 +170,7 @@ def main():
             running_cur = {}
             added = set()
             removed = set()
-            
+
             r = requests.get(rm_addr+'/ws/v1/cluster/apps')
             if r.status_code != 200:
                 print("Failed to connect to the server")
