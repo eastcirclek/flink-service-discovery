@@ -148,6 +148,7 @@ def main():
     app_id = args.app_id
     name_filter_regex = None if args.name_filter is None else re.compile(args.name_filter)
     rm_addr = args.rm_addr if "://" in args.rm_addr else "http://" + args.rm_addr
+    rm_addr = rm_addr[:-1] if rm_addr.endswith('/') else rm_addr
     target_dir = args.target_dir
 
     if target_dir is not None and not os.path.isdir(target_dir):
