@@ -9,34 +9,45 @@ import time
 from functools import partial
 
 
+def flink_cluster_overview(jm_url):
+    r = requests.get(jm_url+'/overview')
+    if r.status_code != 200:
+        return {}
+    decoded = r.json()
+    return decoded
+
+
 def flink_jobmanager_prometheus_addr(jm_url):
     addr = None
     port = None
 
-    r = requests.get(jm_url+'/jobmanager/log', stream=True)
+    r = requests.get(jm_url+'/jobmanager/config')
     if r.status_code != 200:
         return ''
+    dic = {}
+    for obj in r.json():
+        dic[obj['key']] = obj['value']
+    addr = dic['jobmanager.rpc.address']
 
+    r = requests.get(jm_url + '/jobmanager/log', stream=True)
+    if r.status_code != 200:
+        return ''
     for line in r.iter_lines(decode_unicode=True):
-        if "YARN assigned hostname for application master" in line:
-            m = re.search("application master: ([0-9A-Za-z-_]+)", line)
-            if m:
-                addr = m.group(1)
-
         if "Started PrometheusReporter HTTP server on port" in line:
             m = re.search('on port (\d+)', line)
             if m:
                 port = m.group(1)
+                break
 
-        cond1 = addr is not None
-        cond2 = port is not None
-        if cond1 and cond2:
-            return addr+':'+port
+    cond1 = addr is not None
+    cond2 = port is not None
+    if cond1 and cond2:
+        return addr+':'+port
+    else:
+        return ''
 
-    return ''
 
-
-def flink_taskmanager_prometheus_addr(tm_id, jm_url):
+def flink_taskmanager_prometheus_addr(tm_id, jm_url, version):
     addr = None
     port = None
 
@@ -45,11 +56,17 @@ def flink_taskmanager_prometheus_addr(tm_id, jm_url):
         return ''
 
     for line in r.iter_lines(decode_unicode=True):
-        if "TaskManager will use hostname/address" in line:
-            m = re.search("address '([0-9A-Za-z-_]+)' \([\d.]+\)", line)
-            if m:
-                hostname = m.group(1)
-                addr = hostname
+        if "hostname/address" in line:
+            if version.startswith("1.4"):
+                m = re.search("address '([0-9A-Za-z-_]+)' \([\d.]+\)", line)
+                if m:
+                    hostname = m.group(1)
+                    addr = hostname
+            elif version.startswith("1.5") or version.startswith("1.6"):
+                m = re.search("TaskManager: ([0-9A-Za-z-_]+)", line)
+                if m:
+                    hostname = m.group(1)
+                    addr = hostname
 
         if "Started PrometheusReporter HTTP server on port" in line:
             m = re.search('on port (\d+)', line)
@@ -84,28 +101,41 @@ def taskmanager_ids(jm_url):
 
     return [tm['id'] for tm in decoded['taskmanagers']]
 
+def taskmanager_ids(jm_url):
+    r = requests.get(jm_url + '/taskmanagers')
+    if r.status_code != 200:
+        return []
+
+    decoded = r.json()
+    if 'taskmanagers' not in decoded:
+        return []
+
+    return [tm['id'] for tm in decoded['taskmanagers']]
+
 
 def prometheus_addresses(app_id, rm_addr):
+    prom_addrs = []
     while True:
         app_info = yarn_application_info(app_id, rm_addr)
-        cond1 = 'runningContainers' not in app_info
-        cond2 = 'trackingUrl' not in app_info
-        if cond1 or cond2:
+        if 'trackingUrl' not in app_info:
+            time.sleep(1)
+            continue
+        break
+
+    jm_url = app_info['trackingUrl']
+    jm_url = jm_url[:-1] if jm_url.endswith('/') else jm_url
+    overview = flink_cluster_overview(jm_url)
+    version = overview['flink-version']
+    taskmanagers = overview['taskmanagers']
+
+    while True:
+        if app_info['runningContainers'] != taskmanagers+1:
+            print("runningContainers(%d) != jobmanager(1)+taskmanagers(%d)" % (app_info['runningContainers'], taskmanagers))
             time.sleep(1)
             continue
 
-        if app_info['runningContainers'] == 1:
-            print("runningContainers(%d) is still 1" % (app_info['runningContainers'],))
-            time.sleep(1)
-            continue
-
-        tm_ids = taskmanager_ids(app_info['trackingUrl'])
-        if app_info['runningContainers'] != len(tm_ids)+1:
-            print("runningContainers(%d) != jobmanager(1)+taskmanagers(%d)" % (app_info['runningContainers'], len(tm_ids)))
-            time.sleep(1)
-            continue
-
-        prom_addrs = map(partial(flink_taskmanager_prometheus_addr, jm_url=app_info['trackingUrl']), tm_ids)
+        tm_ids = taskmanager_ids(jm_url)
+        prom_addrs = map(partial(flink_taskmanager_prometheus_addr, jm_url=jm_url, version=version), tm_ids)
         prom_addrs = list(filter(lambda x: len(x) > 0, prom_addrs))
         if len(tm_ids) != len(prom_addrs):
             print("Not all taskmanagers open prometheus endpoints. %d of %d opened" % (len(tm_ids), len(prom_addrs)))
@@ -114,11 +144,10 @@ def prometheus_addresses(app_id, rm_addr):
         break
 
     while True:
-        jm_prom_addr = flink_jobmanager_prometheus_addr(app_info['trackingUrl'])
+        jm_prom_addr = flink_jobmanager_prometheus_addr(jm_url)
         if len(jm_prom_addr) == 0:
             time.sleep(1)
             continue
-
         prom_addrs.append(jm_prom_addr)
         break
 
