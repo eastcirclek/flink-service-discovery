@@ -101,17 +101,6 @@ def taskmanager_ids(jm_url):
 
     return [tm['id'] for tm in decoded['taskmanagers']]
 
-def taskmanager_ids(jm_url):
-    r = requests.get(jm_url + '/taskmanagers')
-    if r.status_code != 200:
-        return []
-
-    decoded = r.json()
-    if 'taskmanagers' not in decoded:
-        return []
-
-    return [tm['id'] for tm in decoded['taskmanagers']]
-
 
 def prometheus_addresses(app_id, rm_addr):
     prom_addrs = []
@@ -120,15 +109,19 @@ def prometheus_addresses(app_id, rm_addr):
         if 'trackingUrl' not in app_info:
             time.sleep(1)
             continue
-        break
 
-    jm_url = app_info['trackingUrl']
-    jm_url = jm_url[:-1] if jm_url.endswith('/') else jm_url
-    overview = flink_cluster_overview(jm_url)
-    version = overview['flink-version']
-    taskmanagers = overview['taskmanagers']
+        jm_url = app_info['trackingUrl']
+        jm_url = jm_url[:-1] if jm_url.endswith('/') else jm_url
 
-    while True:
+        overview = flink_cluster_overview(jm_url)
+        version = overview['flink-version']
+        taskmanagers = overview['taskmanagers']
+
+        if app_info['runningContainers'] == 1:
+            print("runningContainers(%d) is 1" % (app_info['runningContainers'],))
+            time.sleep(1)
+            continue
+
         if app_info['runningContainers'] != taskmanagers+1:
             print("runningContainers(%d) != jobmanager(1)+taskmanagers(%d)" % (app_info['runningContainers'], taskmanagers))
             time.sleep(1)
