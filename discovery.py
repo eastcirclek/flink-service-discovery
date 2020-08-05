@@ -3,11 +3,12 @@ import errno
 import json
 import os
 import re
+from json.decoder import JSONDecodeError
+
 import requests
 import sys
 import time
 from functools import partial
-
 
 def flink_cluster_overview(jm_url):
     r = requests.get(jm_url+'/overview')
@@ -38,6 +39,8 @@ def flink_jobmanager_prometheus_addr(jm_url):
             if m:
                 port = m.group(1)
                 break
+        if "No metrics reporter configured" in line:
+            break
 
     cond1 = addr is not None
     cond2 = port is not None
@@ -57,16 +60,10 @@ def flink_taskmanager_prometheus_addr(tm_id, jm_url, version):
 
     for line in r.iter_lines(decode_unicode=True):
         if "hostname/address" in line:
-            if version.startswith("1.4"):
-                m = re.search("address '([0-9A-Za-z-_]+)' \([\d.]+\)", line)
-                if m:
-                    hostname = m.group(1)
-                    addr = hostname
-            else:
-                m = re.search("TaskManager: ([0-9A-Za-z-_]+)", line)
-                if m:
-                    hostname = m.group(1)
-                    addr = hostname
+            m = re.search("TaskManager: ([0-9A-Za-z-_]+)", line)
+            if m:
+                hostname = m.group(1)
+                addr = hostname
 
         if "Started PrometheusReporter HTTP server on port" in line:
             m = re.search('on port (\d+)', line)
@@ -104,66 +101,53 @@ def taskmanager_ids(jm_url):
 
 def prometheus_addresses(app_id, rm_addr):
     prom_addrs = []
-    while True:
-        app_info = yarn_application_info(app_id, rm_addr)
-        if 'trackingUrl' not in app_info:
-            time.sleep(1)
-            continue
+    try:
+        while True:
+            app_info = yarn_application_info(app_id, rm_addr)
+            if 'trackingUrl' not in app_info:
+                time.sleep(1)
+                continue
 
-        jm_url = app_info['trackingUrl']
-        jm_url = jm_url[:-1] if jm_url.endswith('/') else jm_url
+            jm_url = app_info['trackingUrl']
+            jm_url = jm_url[:-1] if jm_url.endswith('/') else jm_url
 
-        overview = flink_cluster_overview(jm_url)
-        if 'flink-version' not in overview:
-            time.sleep(1)
-            continue
-        version = overview['flink-version']
+            overview = flink_cluster_overview(jm_url)
+            if 'flink-version' not in overview:
+                time.sleep(1)
+                continue
+            version = overview['flink-version']
 
-        if 'taskmanagers' not in overview:
-            time.sleep(1)
-            continue
-        taskmanagers = overview['taskmanagers']
+            tm_ids = taskmanager_ids(jm_url)
+            prom_addrs = map(partial(flink_taskmanager_prometheus_addr, jm_url=jm_url, version=version), tm_ids)
+            prom_addrs = list(filter(lambda x: len(x) > 0, prom_addrs))
+            break
 
-        if app_info['runningContainers'] == 1:
-            print(f'runningContainers({app_info["runningContainers"]}) is 1')
-            time.sleep(1)
-            continue
-
-        if app_info['runningContainers'] != taskmanagers+1:
-            print(f'runningContainers({app_info["runningContainers"]}) != jobmanager(1)+taskmanagers({taskmanagers})')
-            time.sleep(1)
-            continue
-
-        tm_ids = taskmanager_ids(jm_url)
-        prom_addrs = map(partial(flink_taskmanager_prometheus_addr, jm_url=jm_url, version=version), tm_ids)
-        prom_addrs = list(filter(lambda x: len(x) > 0, prom_addrs))
-        if len(tm_ids) != len(prom_addrs):
-            print(f'Not all taskmanagers open prometheus endpoints. {len(tm_ids)} of {len(prom_addrs)} opened')
-            time.sleep(1)
-            continue
-        break
-
-    while True:
         jm_prom_addr = flink_jobmanager_prometheus_addr(jm_url)
-        if len(jm_prom_addr) == 0:
-            time.sleep(1)
-            continue
-        prom_addrs.append(jm_prom_addr)
-        break
+        if len(jm_prom_addr) != 0:
+            prom_addrs.append(jm_prom_addr)
 
-    encoded = json.JSONEncoder().encode([{'targets': prom_addrs}])
-    return encoded
-
+        return set(prom_addrs)
+    except JSONDecodeError as e:
+        return set()
 
 def create_json_file(rm_addr, target_dir, app_id):
-    target_string = prometheus_addresses(app_id, rm_addr)
-    if target_dir is not None:
-        path = os.path.join(target_dir, app_id + ".json")
-        with open(path, 'w') as f:
-            print(f'{path} : {target_string}')
-            f.write(target_string)
-    else:
-        print(target_string)    
+    addresses = prometheus_addresses(app_id, rm_addr)
+    create_json_file_from_addresses(addresses, target_dir, app_id)
+
+    return addresses
+
+
+def create_json_file_from_addresses(addresses, target_dir, app_id):
+    if len(addresses) > 0:
+        target_string = json.JSONEncoder().encode([{'targets': list(addresses)}])
+
+        if target_dir is not None:
+            path = os.path.join(target_dir, app_id + ".json")
+            with open(path, 'w') as f:
+                print(f'{path} : {target_string}')
+                f.write(target_string)
+        else:
+            print(target_string)
 
 
 def delete_json_file(target_dir, app_id):
@@ -183,18 +167,21 @@ def main():
     parser.add_argument('rm_addr', type=str,
                         help='(required) Specify yarn.resourcemanager.webapp.address of your YARN cluster.')
     parser.add_argument('--app-id', type=str,
-                        help='If specified, this program runs once for the application. '
+                        help='If it\'s specified, this program runs once for the application. '
                              'Otherwise, it runs as a service.')
     parser.add_argument('--name-filter', type=str,
                         help='A regex to specify applications to watch.')
     parser.add_argument('--target-dir', type=str,
-                        help='If specified, this program writes the target information to a file on the directory. '
+                        help='If it\'s specified, this program writes the target information to a file on the directory. '
                              'Files are named after the application ids. '
                              'Otherwise, it prints to stdout.')
-    parser.add_argument('--poll-interval', type=int, default=5,
+    parser.add_argument('--poll-interval', type=float, default=5,
                         help='Polling interval to YARN in seconds '
                              'to check applications that are newly added or recently finished. '
-                             'Default is 5 seconds.')
+                             'Default : 5 seconds.')
+    parser.add_argument('--scrape-retries', type=int, default=5,
+                        help='JM/TM logs from a newly discovered applications are parsed as many times as this value at most. '
+                             'Default : 10')
 
     args = parser.parse_args()
     app_id = args.app_id
@@ -212,14 +199,18 @@ def main():
     else:
         print(f'start polling every {args.poll_interval} seconds.')
         running_prev = None
+        known_app_addrs = {}
         while True:
             running_cur = {}
-            added = set()
             removed = set()
+
+            print('running_cur' + str(running_cur.keys()))
+            print('known_addrs' + str(known_app_addrs.keys()))
 
             r = requests.get(rm_addr+'/ws/v1/cluster/apps')
             decoded = r.json()
             apps = decoded['apps']['app']
+            apps = list(filter(lambda app: app['applicationType']=='Apache Flink', apps))
             if name_filter_regex is not None:
                 apps = list(filter(lambda app: name_filter_regex.match(app['name']), apps))
 
@@ -234,7 +225,6 @@ def main():
                     running_cur[app['id']] = app
 
             if running_prev is not None:
-                added = set(running_cur.keys()) - set(running_prev.keys())
                 removed = set(running_prev.keys()) - set(running_cur.keys())
 
                 for app_id in running_cur:
@@ -244,19 +234,24 @@ def main():
                         if last_attempt_cur > last_attempt_prev:
                             print(f'a new attempt id detected for {app_id} ({last_attempt_prev}->{last_attempt_cur})')
                             delete_json_file(target_dir, app_id)
-                            create_json_file(rm_addr, target_dir, app_id)
-                
-            if len(added) + len(removed) > 0:
-                print(f'==== {time.strftime("%c")} ====')
-                print(f'# running apps : {len(running_cur)}')
-                print(f'# added        : {added}')
-                print(f'# removed      : {removed}')
+                            known_app_addrs[app_id] = create_json_file(rm_addr, target_dir, app_id)
 
-                for app_id in added:
-                    create_json_file(rm_addr, target_dir, app_id)
+            if len(removed) > 0:
+                print(f'==== {time.strftime("%c")} ====')
+                print(f'# removed      : {removed}')
 
                 for app_id in removed:
                     delete_json_file(target_dir, app_id)
+                    del known_app_addrs[app_id]
+
+            for app_id in running_cur:
+                addrs = prometheus_addresses(app_id, rm_addr)
+                if app_id not in known_app_addrs:
+                    known_app_addrs[app_id] = addrs
+                else:
+                    if known_app_addrs[app_id] != addrs:
+                        delete_json_file(target_dir, app_id)
+                        create_json_file_from_addresses(addrs, target_dir, app_id)
 
             running_prev = running_cur
             time.sleep(args.poll_interval)
